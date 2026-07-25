@@ -1,0 +1,13 @@
+[package]
+name = "qoz"
+version = "0.1.0"
+edition = "2024"
+description = "QOZ: a minimal image format storing zstd-compressed raw pixel tiles, optimized for decode speed"
+license = "MIT"
+
+[dependencies]
+zstd = { version = "0.13", default-features = false }
+thiserror = { version = "2", default-features = false }
+rayon = { version = "1.12.0", default-features = false }
+
+[dev-dependencies]

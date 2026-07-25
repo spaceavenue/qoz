@@ -1,0 +1,15 @@
+[package]
+name = "qoz-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "qoz"
+path = "src/main.rs"
+
+[dependencies]
+qoz = { path = "../qoz" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "gif", "webp", "qoi"] }
+clap = { version = "4.5.4", features = ["derive"] }
+qoi = "0.4"
+memmap2 = "0.9.11"
