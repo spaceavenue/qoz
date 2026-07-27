@@ -116,6 +116,16 @@ impl Default for EncodeOptions {
         }
     }
 }
+impl EncodeOptions {
+    pub fn new(channels: u8, colorspace: u8, level: i32, tile_rows: u32) -> Self {
+        Self {
+            channels,
+            colorspace,
+            level,
+            tile_rows,
+        }
+    }
+}
 
 pub fn encode(
     pixels: &[u8],
