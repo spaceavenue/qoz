@@ -9,7 +9,14 @@ path = "src/main.rs"
 
 [dependencies]
 qoz = { path = "../qoz" }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "gif", "webp", "qoi"] }
+image = { 
+	version = "0.25.10", 
+	default-features = false, 
+	features = [
+	"avif-native", "png", "jpeg", "webp", "gif", "bmp", "tiff", "tga", "dds", "exr", "hdr", "ico", "pnm", "qoi", "rayon"
+	] 
+}
 clap = { version = "4.5.4", features = ["derive"] }
 qoi = "0.4"
 memmap2 = "0.9.11"
+zstd-sys = { version = "2.0", features = ["pkg-config"] }
