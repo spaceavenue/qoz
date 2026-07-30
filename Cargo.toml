@@ -1,9 +1,9 @@
 [workspace]
-members = ["qoz", "qoz-cli"]
+members = ["qoz", "qoz-cli", "qoz-c"]
 resolver = "2"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# panic = "abort"

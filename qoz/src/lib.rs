@@ -8,35 +8,44 @@
 //! File layout:
 //! ```text
 //! [magic: 4 bytes "QOZ1"]
+//! [width: u32 LE]
+//! [height: u32 LE]
 //! [channels: u8]
 //! [colorspace: u8]
 //! [reserved: u8]
 //! [reserved: u8]
-//! [width: u32 LE]
-//! [height: u32 LE]
 //! [tile_rows: u32 LE]
 //! [tile_count: u32 LE]
 //! [tile_len: u64 LE] * tile_count       <- compressed length table
 //! [tile compressed bytes] * tile_count  <- concatenated zstd frames
 //! ```
 //!
-//! Tiles are horizontal row bands. Because pixel data is row-major, a tile's raw bytes are always a
-//! contiguous slice of the full buffer.
+//! Tiles are horizontal row bands and are contiguous slices of the full buffer.
 
-use std::{io, thread};
+mod header;
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
+use zstd::zstd_safe::CParameter::WindowLog;
+use zstd::zstd_safe::DParameter;
+
+use crate::QozError::{InvalidChannels, InvalidColorspace};
 
 pub const MAGIC: [u8; 4] = *b"QOZ1";
-pub const HEADER_LEN: usize = 4 + 4 + 16; // magic + 4 u8 fields + 4 u32 fields
+// magic + 4 (1-byte) u8 fields + 4 (4-byte) u32 fields
+pub const HEADER_LEN: usize = 4 + 4 + 16;
+pub const MAX_PIXELS: u32 = u32::MAX;
 
 #[derive(Debug, Error)]
 pub enum QozError {
     #[error("input buffer length {actual} does not match width*height*channels ({expected})")]
     SizeMismatch { expected: usize, actual: usize },
+    #[error("invalid dimensions: both must be non-zero and width*height must be < 2^32")]
+    InvalidDimensions,
     #[error("invalid channel count: {0} (must be 1-4)")]
     InvalidChannels(u8),
+    #[error("unsupported colorspace: {0} (must be 0 (Srgb) or 1 (Linear))")]
+    InvalidColorspace(u8),
     #[error("data too short to contain a valid QOZ header")]
     Truncated,
     #[error("bad magic bytes: expected {MAGIC:?}")]
@@ -44,80 +53,264 @@ pub enum QozError {
     #[error("tile length table or tile data is truncated/corrupt")]
     CorruptTileTable,
     #[error("zstd error: {0}")]
-    Zstd(#[from] io::Error),
+    Zstd(#[from] std::io::Error),
 }
 
+/// The color channels of a pixel in the image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Channels {
+    /// Grayscale.
+    Gray = 1,
+    /// Grayscale with alpha channel.
+    GrayA = 2,
+    /// Red, Green, Blue.
+    Rgb = 3,
+    /// Red, Green, Blue, Alpha.
+    #[default]
+    Rgba = 4,
+}
+impl std::fmt::Display for Channels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Channels::Gray => f.write_str("Grayscale (1)"),
+            Channels::GrayA => f.write_str("Grayscale w/ Alpha (2)"),
+            Channels::Rgb => f.write_str("RGB (3)"),
+            Channels::Rgba => f.write_str("RGBA (4)"),
+        }
+    }
+}
+impl TryFrom<u8> for Channels {
+    type Error = QozError;
+
+    fn try_from(channels: u8) -> Result<Self, Self::Error> {
+        match channels {
+            1 => Ok(Channels::Gray),
+            2 => Ok(Channels::GrayA),
+            3 => Ok(Channels::Rgb),
+            4 => Ok(Channels::Rgba),
+            _ => Err(InvalidChannels(channels)),
+        }
+    }
+}
+impl From<Channels> for u8 {
+    fn from(channel: Channels) -> Self {
+        channel as Self
+    }
+}
+
+/// The colorspace of an image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColorSpace {
+    #[default]
+    Srgb = 0,
+    Linear = 1,
+}
+impl std::fmt::Display for ColorSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColorSpace::Srgb => f.write_str("srgb"),
+            ColorSpace::Linear => f.write_str("linear"),
+        }
+    }
+}
+impl TryFrom<u8> for ColorSpace {
+    type Error = QozError;
+
+    fn try_from(colorspace: u8) -> Result<Self, Self::Error> {
+        match colorspace {
+            0 => Ok(ColorSpace::Srgb),
+            1 => Ok(ColorSpace::Linear),
+            _ => Err(InvalidColorspace(colorspace)),
+        }
+    }
+}
+impl From<ColorSpace> for u8 {
+    fn from(channel: ColorSpace) -> Self {
+        channel as Self
+    }
+}
+
+/// Image header. Consists of channels, color space, width, height, number of rows per zstd
+/// compressed tile and total number of tiles.
+/// Notes:
+/// * Both width and height must be non-zero.
+/// * Maximum number of pixels is 2^32 (~4 GP or ~400MP).
+/// * tile rows are calculated from the image height; see `[default_tile_rows()]`.
+/// * tile count depends on tile rows, and will by default try to match the number of CPU cores the
+///   image was encoded on.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
-    pub channels: u8,
-    pub colorspace: u8,
+    /// Width of the image.
     pub width: u32,
+    /// Height of the image.
     pub height: u32,
+    /// Number of color channels per pixel.
+    pub channels: Channels,
+    /// Color space of the image. Purely informative and does not affect encode/decode.
+    pub colorspace: ColorSpace,
+    /// Number of rows per zstd compressed tiles.
     pub tile_rows: u32,
+    /// Number of zstd compressed tiles.
     pub tile_count: u32,
 }
-
 impl Header {
+    /// Creates a new header and validates image dimensions.
+    #[inline]
+    pub const fn try_new(
+        width: u32,
+        height: u32,
+        channels: Channels,
+        colorspace: ColorSpace,
+        tile_rows: u32,
+        tile_count: u32,
+    ) -> Result<Self, QozError> {
+        let n_pixels = width.saturating_mul(height);
+        if n_pixels == 0 {
+            return Err(QozError::InvalidDimensions);
+        }
+        Ok(Self {
+            width,
+            height,
+            channels,
+            colorspace,
+            tile_rows,
+            tile_count,
+        })
+    }
+
+    /// Returns the bytes per pixel.
+    #[inline]
     pub fn bytes_per_pixel(&self) -> usize {
         self.channels as usize
     }
+    /// Returns the total pixels.
+    #[inline]
+    pub fn num_pixels(&self) -> usize {
+        self.width.saturating_mul(self.height) as usize
+    }
+    /// Returns the total bytes.
+    #[inline]
+    pub fn num_bytes(&self) -> usize {
+        self.num_pixels() * self.bytes_per_pixel()
+    }
+    /// Decodes the header from byte array.
+    #[inline]
+    pub fn decode_header(data: impl AsRef<[u8]>) -> Result<Header, QozError> {
+        let data = data.as_ref();
+        if data.len() < HEADER_LEN {
+            return Err(QozError::Truncated);
+        }
+        if data[0..4] != MAGIC {
+            return Err(QozError::BadMagic);
+        }
+        let width = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let height = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let channels = data[12].try_into()?;
+        let colorspace = data[13].try_into()?;
+        // data[14..16] reserved
+        let tile_rows = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let tile_count = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        Self::try_new(width, height, channels, colorspace, tile_rows, tile_count)
+    }
 
-    pub fn total_bytes(&self) -> usize {
-        self.width as usize * self.height as usize * self.bytes_per_pixel()
+    /// Encodes the header as a byte array.
+    #[inline]
+    pub fn encode_header(&self) -> [u8; HEADER_LEN] {
+        let mut out = [0; HEADER_LEN];
+        out[..4].copy_from_slice(&MAGIC);
+        out[4..8].copy_from_slice(&self.width.to_le_bytes());
+        out[8..12].copy_from_slice(&self.height.to_le_bytes());
+        out[12] = self.channels.into();
+        out[13] = self.colorspace.into();
+        out[14..16].copy_from_slice(&[0u8; 2]);
+        out[16..20].copy_from_slice(&self.tile_rows.to_le_bytes());
+        out[20..24].copy_from_slice(&self.tile_count.to_le_bytes());
+        out
+    }
+
+    /// Creates a new header with modified channels.
+    #[inline]
+    pub const fn with_channels(mut self, channels: Channels) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// Creates a new header with modified color space.
+    #[inline]
+    pub const fn with_colorspace(mut self, colorspace: ColorSpace) -> Self {
+        self.colorspace = colorspace;
+        self
     }
 }
 
-/// Pick a default tile height so tile_count ~= available parallelism.
-/// With 1 core this is a single tile/zstd frame.
+/// Pick a default tile height so tile_count ~= available parallelism. With 1 core this is a single
+/// tile/zstd frame.
+#[inline]
 pub fn default_tile_rows(height: u32) -> u32 {
-    let threads = thread::available_parallelism()
+    let threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
     let rows = height.div_ceil(threads);
     rows.max(1)
 }
 
-fn tile_row_ranges(height: u32, tile_rows: u32) -> Vec<(u32, u32)> {
+/// The upper bound of the the encoded image's size. This is the worst case and the compressed size
+/// will generally be smaller.
+///
+/// Can be used to preallocate space for a buffer to encode the image into.
+pub fn encode_max_len(width: u32, height: u32, channels: Channels, tile_rows: u32) -> usize {
+    let tile_rows = if tile_rows == 0 {
+        default_tile_rows(height)
+    } else {
+        tile_rows
+    };
     let mut ranges = Vec::new();
     let mut row = 0u32;
     while row < height {
         let rows = tile_rows.min(height - row);
-        ranges.push((row, rows));
+        ranges.push(rows);
         row += rows;
     }
     if ranges.is_empty() {
         // zero-height image edge case
-        ranges.push((0, 0));
+        ranges.push(0);
     }
-    ranges
+    let row_stride = width as usize * u8::from(channels) as usize;
+    let tile_upper_bound = ranges
+        .iter()
+        .map(|rows| zstd::zstd_safe::compress_bound(*rows as usize * row_stride))
+        .sum::<usize>();
+    HEADER_LEN + 8 * ranges.len() + tile_upper_bound
 }
 
-// Encode
-
+/// Encode options.
 pub struct EncodeOptions {
-    pub channels: u8,
-    pub colorspace: u8,
-    /// zstd compression level. Decode speed is nearly independent of this;
-    /// higher levels mostly cost more encode time in exchange for better
-    /// ratio (and sometimes *faster* decode, since longer matches shift
-    /// work from entropy-coded literals to memcpy).
+    pub channels: Channels,
+    pub colorspace: ColorSpace,
+    /// zstd compression level. Decode speed is nearly independent of this, so higher levels mostly
+    /// cost more encode time in exchange for better ratio, and sometimes faster decode, since
+    /// longer matches shift work from entropy-coded literals to memcpy.
     pub level: i32,
     /// Rows per tile. 0 = pick automatically from available CPU cores.
     pub tile_rows: u32,
 }
 
 impl Default for EncodeOptions {
+    #[inline]
     fn default() -> Self {
         Self {
-            channels: 4,
-            colorspace: 0,
+            channels: Channels::default(),
+            colorspace: ColorSpace::default(),
             level: 9,
             tile_rows: 0,
         }
     }
 }
 impl EncodeOptions {
-    pub fn new(channels: u8, colorspace: u8, level: i32, tile_rows: u32) -> Self {
+    #[inline]
+    pub fn new(channels: Channels, colorspace: ColorSpace, level: i32, tile_rows: u32) -> Self {
         Self {
             channels,
             colorspace,
@@ -127,16 +320,31 @@ impl EncodeOptions {
     }
 }
 
+/// Encode raw pixel bytes into a new `Vec<u8>`.
 pub fn encode(
-    pixels: &[u8],
+    pixels: impl AsRef<[u8]>,
     width: u32,
     height: u32,
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>, QozError> {
+    let mut buf = vec![0u8; encode_max_len(width, height, opts.channels, opts.tile_rows)];
+    let bytes_written = encode_into_buf(pixels.as_ref(), width, height, opts, &mut buf)?;
+    buf.truncate(bytes_written);
+    Ok(buf)
+}
+
+/// Encode raw pixel bytes into a provided buffer.
+pub fn encode_into_buf(
+    pixels: impl AsRef<[u8]>,
+    width: u32,
+    height: u32,
+    opts: &EncodeOptions,
+    mut buf: impl AsMut<[u8]>,
+) -> Result<usize, QozError> {
+    let pixels = pixels.as_ref();
+    let buf = buf.as_mut();
     let channels = opts.channels;
-    if !(1..=4).contains(&channels) {
-        return Err(QozError::InvalidChannels(channels));
-    }
+    let colorspace = opts.colorspace;
     let expected = width as usize * height as usize * channels as usize;
     if pixels.len() != expected {
         return Err(QozError::SizeMismatch {
@@ -150,103 +358,131 @@ pub fn encode(
     } else {
         opts.tile_rows
     };
-    let ranges = tile_row_ranges(height, tile_rows);
-    let row_stride = width as usize * channels as usize;
+    let chunk_size = width as usize * channels as usize * tile_rows as usize;
+    let tile_slices = pixels.chunks(chunk_size).collect::<Vec<&[u8]>>();
+    let tile_count = tile_slices.len();
+    let tile_len_table_size = tile_count * 8;
+    let data_offset = HEADER_LEN + tile_len_table_size;
 
-    // Slice the input into per-tile byte ranges.
-    let tile_slices: Vec<&[u8]> = ranges
+    // Each tile's length is initially the zstd compressions's upper bound and they'll be
+    // compacted to their true size later.
+    let tile_upper_bounds = tile_slices
         .iter()
-        .map(|(start, rows)| {
-            let a = *start as usize * row_stride;
-            let b = a + *rows as usize * row_stride;
-            &pixels[a..b]
-        })
-        .collect();
+        .map(|tile| zstd::zstd_safe::compress_bound(tile.len()))
+        .collect::<Vec<usize>>();
 
-    let compressed: Result<Vec<Vec<u8>>, QozError> = tile_slices
+    // Slice the output into per-tile byte slices, which we can then hand over to a thread. This
+    // allows us to decode into the buffer directly, preventing a temporary copy of the compressed
+    // data being created in memory.
+    let mut out_slices: Vec<&mut [u8]> = Vec::with_capacity(tile_count);
+    {
+        let mut rest = &mut buf[data_offset..];
+        for &bound in &tile_upper_bounds {
+            let (a, b) = rest.split_at_mut(bound);
+            out_slices.push(a);
+            rest = b;
+        }
+    }
+
+    // Compress data. Returns a Vec of bytes written for each tile.
+    let true_lens: Result<Vec<usize>, QozError> = tile_slices
         .into_par_iter()
+        .zip(out_slices)
         .map_init(
             || zstd::bulk::Compressor::new(opts.level),
-            |compressor_res, tile| match compressor_res {
-                Ok(compressor) => compressor.compress(tile).map_err(QozError::Zstd),
-                Err(e) => Err(QozError::Zstd(io::Error::new(e.kind(), "zstd init error"))),
+            |compressor_res, (tile, out_slice)| match compressor_res {
+                Ok(compressor) => {
+                    compressor.set_parameter(WindowLog(tile.len().ilog2()))?;
+                    let n = compressor
+                        .compress_to_buffer(tile, out_slice)
+                        .map_err(QozError::Zstd)?;
+                    Ok(n)
+                }
+                Err(e) => Err(QozError::Zstd(std::io::Error::new(
+                    e.kind(),
+                    "zstd init error",
+                ))),
             },
         )
         .collect();
-    let compressed = compressed?;
+    let true_lens = true_lens?;
+
+    // Compact the tiles.
+    let mut current_read_offset = data_offset;
+    let mut current_write_offset = data_offset;
+    tile_upper_bounds
+        .iter()
+        .zip(true_lens.iter())
+        .for_each(|(&max_bound, &true_len)| {
+            // Only move data if there's a gap (Tile 0 is always already in place)
+            if current_read_offset != current_write_offset {
+                let read_end = current_read_offset + true_len;
+                buf.copy_within(current_read_offset..read_end, current_write_offset);
+            }
+            current_read_offset += max_bound;
+            current_write_offset += true_len;
+        });
 
     // Assemble the file
-    // header size + length table + concatenated compressed tiles
-    let tile_count = compressed.len() as u32;
-    let mut out = Vec::with_capacity(
-        HEADER_LEN + 8 * compressed.len() + compressed.iter().map(|c| c.len()).sum::<usize>(),
-    );
-    out.extend_from_slice(&MAGIC);
-    out.push(channels);
-    out.push(opts.colorspace);
-    out.push(0); // reserved
-    out.push(0); // reserved
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&tile_rows.to_le_bytes());
-    out.extend_from_slice(&tile_count.to_le_bytes());
-    compressed
-        .iter()
-        .for_each(|c| out.extend_from_slice(&(c.len() as u64).to_le_bytes()));
-    compressed.iter().for_each(|c| out.extend_from_slice(c));
-    Ok(out)
-}
-
-// Decode
-
-fn parse_header(data: &[u8]) -> Result<Header, QozError> {
-    if data.len() < HEADER_LEN {
-        return Err(QozError::Truncated);
-    }
-    if data[0..4] != MAGIC {
-        return Err(QozError::BadMagic);
-    }
-    let channels = data[4];
-    let colorspace = data[5];
-    // data[6] reserved
-    // data[7] reserved
-    let width = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    let height = u32::from_le_bytes(data[12..16].try_into().unwrap());
-    let tile_rows = u32::from_le_bytes(data[16..20].try_into().unwrap());
-    let tile_count = u32::from_le_bytes(data[20..24].try_into().unwrap());
-    if !(1..=4).contains(&channels) {
-        return Err(QozError::InvalidChannels(channels));
-    }
-    Ok(Header {
+    // header + length table + concatenated compressed tiles
+    let header = Header::try_new(
         width,
         height,
         channels,
         colorspace,
         tile_rows,
-        tile_count,
-    })
+        tile_count as u32,
+    )?
+    .encode_header();
+
+    // header
+    buf[0..HEADER_LEN].copy_from_slice(&header);
+
+    // tile length table
+    true_lens.iter().enumerate().for_each(|(i, &len)| {
+        let start = HEADER_LEN + (i * 8);
+        let end = start + 8;
+        buf[start..end].copy_from_slice(&(len as u64).to_le_bytes());
+    });
+    // compressed tiles
+    // let mut current_offset = HEADER_LEN + tile_len_table_size;
+    // for c in out_slices.iter() {
+    //     let end_offset = current_offset + c.len();
+    //     buf[current_offset..end_offset].copy_from_slice(c);
+    //     current_offset = end_offset;
+    // }
+    Ok(current_write_offset)
 }
 
-/// Parse just the header, without decompressing image data.
+/// Parse the header, without decompressing image data.
+#[inline]
 pub fn read_header(data: &[u8]) -> Result<Header, QozError> {
-    parse_header(data)
+    Header::decode_header(data)
 }
 
-// Decode and return the header + decompressed data.
+/// Decode and return header + decompressed data.
+#[inline]
 pub fn decode(data: &[u8]) -> Result<(Header, Vec<u8>), QozError> {
-    let header = parse_header(data)?;
-    let mut out = vec![0u8; header.total_bytes()];
-    decode_into(data, &mut out)?;
+    let header = Header::decode_header(data)?;
+    // let mut out = vec![0u8; header.num_bytes()];
+    let mut out = Vec::with_capacity(header.num_bytes());
+    unsafe {
+        // SAFETY: Immediately passed to decode_into_buf, which guarantees every single byte is
+        // overwritten by the zstd decompressor or returns an error; see `n != out_slice.len()
+        // below.
+        out.set_len(header.num_bytes());
+    }
+    decode_into_buf(data, &mut out)?;
     Ok((header, out))
 }
 
-/// Decode into a caller-provided buffer, which must be exactly width*height*channels
-/// bytes. Returns the header as well.
-pub fn decode_into(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
-    let header = parse_header(data)?;
-    if out.len() != header.total_bytes() {
+/// Decode into a provided buffer, which must be exactly width*height*channels bytes. Returns the
+/// header as well.
+pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
+    let header = Header::decode_header(data)?;
+    if out.len() != header.num_bytes() {
         return Err(QozError::SizeMismatch {
-            expected: header.total_bytes(),
+            expected: header.num_bytes(),
             actual: out.len(),
         });
     }
@@ -264,12 +500,7 @@ pub fn decode_into(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
         tile_lens.push(len);
     }
 
-    let ranges = tile_row_ranges(header.height, header.tile_rows.max(1));
-    if ranges.len() != header.tile_count as usize {
-        return Err(QozError::CorruptTileTable);
-    }
-
-    let row_stride = header.width as usize * header.channels as usize;
+    // let row_stride = header.width as usize * header.channels as usize;
     let mut blob_offset = table_start + table_len;
     let mut tile_blobs: Vec<&[u8]> = Vec::with_capacity(tile_lens.len());
     for len in &tile_lens {
@@ -280,18 +511,10 @@ pub fn decode_into(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
         blob_offset += len;
     }
 
-    // Split the output buffer into disjoint per-tile mutable slices up front, then hand each
-    // (compressed tile, output slice) pair to a worker thread.
-    let mut out_slices: Vec<&mut [u8]> = Vec::with_capacity(ranges.len());
-    {
-        let mut rest = out;
-        for (_, rows) in &ranges {
-            let n = *rows as usize * row_stride;
-            let (a, b) = rest.split_at_mut(n);
-            out_slices.push(a);
-            rest = b;
-        }
-    }
+    let chunk_size =
+        header.width as usize * header.channels as usize * header.tile_rows.max(1) as usize;
+    let out_slices = out.chunks_mut(chunk_size).collect::<Vec<&mut [u8]>>();
+
     let results: Result<Vec<()>, QozError> = out_slices
         .into_par_iter()
         .zip(tile_blobs.into_par_iter())
@@ -299,6 +522,7 @@ pub fn decode_into(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
             || zstd::bulk::Decompressor::new(),
             |decompressor_res, (out_slice, blob)| match decompressor_res {
                 Ok(decompressor) => {
+                    decompressor.set_parameter(DParameter::WindowLogMax(blob.len().ilog2()))?;
                     let n = decompressor
                         .decompress_to_buffer(blob, out_slice)
                         .map_err(QozError::Zstd)?;
@@ -323,11 +547,11 @@ pub fn decode_into(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
 mod tests {
     use super::*;
 
-    fn make_test_image(w: u32, h: u32, channels: u8) -> Vec<u8> {
+    fn make_test_image(w: u32, h: u32, channels: Channels) -> Vec<u8> {
         let mut v = Vec::with_capacity(w as usize * h as usize * channels as usize);
         for y in 0..h {
             for x in 0..w {
-                for c in 0..channels {
+                for c in 0..channels.into() {
                     // Some structure (gradient + a flat block).
                     let val = ((x + y * 2 + c as u32 * 7) % 251) as u8;
                     v.push(val);
@@ -337,11 +561,11 @@ mod tests {
         v
     }
 
-    fn roundtrip(w: u32, h: u32, channels: u8, tile_rows: u32) {
+    fn roundtrip(w: u32, h: u32, channels: Channels, tile_rows: u32) {
         let pixels = make_test_image(w, h, channels);
         let opts = EncodeOptions {
-            channels,
-            colorspace: 0,
+            channels: channels,
+            colorspace: ColorSpace::default(),
             level: 3,
             tile_rows,
         };
@@ -358,7 +582,12 @@ mod tests {
 
     #[test]
     fn roundtrip_various_sizes() {
-        for &channels in &[1u8, 2, 3, 4] {
+        for &channels in &[
+            Channels::Gray,
+            Channels::GrayA,
+            Channels::Rgb,
+            Channels::Rgba,
+        ] {
             roundtrip(1, 1, channels, 0);
             roundtrip(1, 1, channels, 1);
             roundtrip(37, 1, channels, 0);
@@ -372,8 +601,8 @@ mod tests {
     #[test]
     fn zero_height_image() {
         let opts = EncodeOptions {
-            channels: 4,
-            colorspace: 0,
+            channels: Channels::default(),
+            colorspace: ColorSpace::default(),
             level: 3,
             tile_rows: 0,
         };
