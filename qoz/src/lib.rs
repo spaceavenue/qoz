@@ -22,8 +22,6 @@
 //!
 //! Tiles are horizontal row bands and are contiguous slices of the full buffer.
 
-mod header;
-
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
 use zstd::zstd_safe::CParameter::WindowLog;
