@@ -38,20 +38,24 @@ pub const MAX_PIXELS: u32 = u32::MAX;
 
 #[derive(Debug, Error)]
 pub enum QozError {
-    #[error("input buffer length {actual} does not match width*height*channels ({expected})")]
+    #[error("input buffer length {actual} does not match width * height * channels ({expected})")]
     SizeMismatch { expected: usize, actual: usize },
-    #[error("invalid dimensions: both must be non-zero and width*height must be < 2^32")]
-    InvalidDimensions,
+    #[error("invalid dimensions: {w}x{h}. both must be non-zero and width * height must be < 2^32")]
+    InvalidDimensions { w: u32, h: u32 },
     #[error("invalid channel count: {0} (must be 1-4)")]
     InvalidChannels(u8),
     #[error("unsupported colorspace: {0} (must be 0 (Srgb) or 1 (Linear))")]
     InvalidColorspace(u8),
-    #[error("data too short to contain a valid QOZ header")]
-    Truncated,
+    #[error("data too short to contain a valid QOZ header: expected {HEADER_LEN}, got {actual}")]
+    Truncated { actual: usize },
     #[error("bad magic bytes: expected {MAGIC:?}")]
     BadMagic,
-    #[error("tile length table or tile data is truncated/corrupt")]
-    CorruptTileTable,
+    #[error("tile length table requires {required} bytes, but only {available} remain")]
+    TruncatedTileTable { required: usize, available: usize },
+    #[error("tile {index} offset extends beyond file bounds")]
+    TileOutOfBounds { index: usize },
+    #[error("decompressed tile size ({actual}) does not match expected size ({expected})")]
+    TileDecompressionSizeMismatch { expected: usize, actual: usize },
     #[error("zstd error: {0}")]
     Zstd(#[from] std::io::Error),
 }
@@ -166,9 +170,15 @@ impl Header {
         tile_rows: u32,
         tile_count: u32,
     ) -> Result<Self, QozError> {
-        let n_pixels = width.saturating_mul(height);
-        if n_pixels == 0 {
-            return Err(QozError::InvalidDimensions);
+        if width == 0 || height == 0 {
+            return Err(QozError::InvalidDimensions {
+                w: width,
+                h: height,
+            });
+        }
+        let n_pixels = width.checked_mul(height);
+        if n_pixels.is_none() {
+            return Err(QozError::InvalidChannels(u8::MAX));
         }
         Ok(Self {
             width,
@@ -200,7 +210,7 @@ impl Header {
     pub fn decode_header(data: impl AsRef<[u8]>) -> Result<Header, QozError> {
         let data = data.as_ref();
         if data.len() < HEADER_LEN {
-            return Err(QozError::Truncated);
+            return Err(QozError::Truncated { actual: data.len() });
         }
         if data[0..4] != MAGIC {
             return Err(QozError::BadMagic);
@@ -261,6 +271,9 @@ pub fn default_tile_rows(height: u32) -> u32 {
 ///
 /// Can be used to preallocate space for a buffer to encode the image into.
 pub fn encode_max_len(width: u32, height: u32, channels: Channels, tile_rows: u32) -> usize {
+    if width == 0 || height == 0 {
+        return 0;
+    }
     let tile_rows = if tile_rows == 0 {
         default_tile_rows(height)
     } else {
@@ -272,10 +285,6 @@ pub fn encode_max_len(width: u32, height: u32, channels: Channels, tile_rows: u3
         let rows = tile_rows.min(height - row);
         ranges.push(rows);
         row += rows;
-    }
-    if ranges.is_empty() {
-        // zero-height image edge case
-        ranges.push(0);
     }
     let row_stride = width as usize * u8::from(channels) as usize;
     let tile_upper_bound = ranges
@@ -341,6 +350,12 @@ pub fn encode_into_buf(
     opts: &EncodeOptions,
     mut buf: impl AsMut<[u8]>,
 ) -> Result<usize, QozError> {
+    if width == 0 || height == 0 {
+        return Err(QozError::InvalidDimensions {
+            w: width,
+            h: height,
+        });
+    }
     let pixels = pixels.as_ref();
     let buf = buf.as_mut();
     let channels = opts.channels;
@@ -399,8 +414,8 @@ pub fn encode_into_buf(
                     Ok(n)
                 }
                 Err(e) => Err(QozError::Zstd(std::io::Error::new(
-                    e.kind(),
-                    "zstd init error",
+                    std::io::ErrorKind::Other,
+                    format!("zstd initialization failed: {e}"),
                 ))),
             },
         )
@@ -408,19 +423,19 @@ pub fn encode_into_buf(
     let true_lens = true_lens?;
 
     // Compact the tiles.
-    let mut current_read_offset = data_offset;
-    let mut current_write_offset = data_offset;
+    let mut read_offset = data_offset;
+    let mut write_offset = data_offset;
     tile_upper_bounds
         .iter()
         .zip(true_lens.iter())
         .for_each(|(&max_bound, &true_len)| {
             // Only move data if there's a gap (Tile 0 is always already in place)
-            if current_read_offset != current_write_offset {
-                let read_end = current_read_offset + true_len;
-                buf.copy_within(current_read_offset..read_end, current_write_offset);
+            if read_offset != write_offset {
+                let read_end = read_offset + true_len;
+                buf.copy_within(read_offset..read_end, write_offset);
             }
-            current_read_offset += max_bound;
-            current_write_offset += true_len;
+            read_offset += max_bound;
+            write_offset += true_len;
         });
 
     // Assemble the file
@@ -451,7 +466,7 @@ pub fn encode_into_buf(
     //     buf[current_offset..end_offset].copy_from_slice(c);
     //     current_offset = end_offset;
     // }
-    Ok(current_write_offset)
+    Ok(write_offset)
 }
 
 /// Parse the header, without decompressing image data.
@@ -480,6 +495,12 @@ pub fn decode(data: &[u8]) -> Result<(Header, Vec<u8>), QozError> {
 /// header as well.
 pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> {
     let header = Header::decode_header(data)?;
+    if header.width == 0 || header.height == 0 {
+        return Err(QozError::InvalidDimensions {
+            w: header.width,
+            h: header.height,
+        });
+    }
     if out.len() != header.num_bytes() {
         return Err(QozError::SizeMismatch {
             expected: header.num_bytes(),
@@ -491,7 +512,10 @@ pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> 
     let table_start = HEADER_LEN;
     let table_len = 8 * header.tile_count as usize;
     if data.len() < table_start + table_len {
-        return Err(QozError::CorruptTileTable);
+        return Err(QozError::TruncatedTileTable {
+            required: data.len(),
+            available: table_start + table_len,
+        });
     }
     let mut tile_lens = Vec::with_capacity(header.tile_count as usize);
     for i in 0..header.tile_count as usize {
@@ -505,7 +529,9 @@ pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> 
     let mut tile_blobs: Vec<&[u8]> = Vec::with_capacity(tile_lens.len());
     for len in &tile_lens {
         if blob_offset + len > data.len() {
-            return Err(QozError::CorruptTileTable);
+            return Err(QozError::TileOutOfBounds {
+                index: blob_offset + len,
+            });
         }
         tile_blobs.push(&data[blob_offset..blob_offset + len]);
         blob_offset += len;
@@ -527,13 +553,16 @@ pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> 
                         .decompress_to_buffer(blob, out_slice)
                         .map_err(QozError::Zstd)?;
                     if n != out_slice.len() {
-                        return Err(QozError::CorruptTileTable);
+                        return Err(QozError::TileDecompressionSizeMismatch {
+                            expected: out_slice.len(),
+                            actual: n,
+                        });
                     }
                     Ok(())
                 }
                 Err(e) => Err(QozError::Zstd(std::io::Error::new(
-                    e.kind(),
-                    "zstd init error",
+                    std::io::ErrorKind::Other,
+                    format!("zstd initialization failed: {e}"),
                 ))),
             },
         )
@@ -606,11 +635,11 @@ mod tests {
             level: 3,
             tile_rows: 0,
         };
-        let encoded = encode(&[], 10, 0, &opts).unwrap();
-        let (header, decoded) = decode(&encoded).unwrap();
-        assert_eq!(header.width, 10);
-        assert_eq!(header.height, 0);
-        assert!(decoded.is_empty());
+        let err_h = encode(&[], 10, 0, &opts).unwrap_err();
+        assert!(matches!(err_h, QozError::InvalidDimensions { w: 10, h: 0 }));
+
+        let err_w = encode(&[], 0, 10, &opts).unwrap_err();
+        assert!(matches!(err_w, QozError::InvalidDimensions { w: 0, h: 10 }));
     }
 
     #[test]

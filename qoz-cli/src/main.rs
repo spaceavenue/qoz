@@ -1,15 +1,13 @@
-use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use image::ExtendedColorType;
 use memmap2::{Mmap, MmapMut};
 use qoz::{Channels, ColorSpace, EncodeOptions};
-
-type BoxErr = Box<dyn Error>;
 
 #[derive(Parser)]
 #[command(
@@ -59,12 +57,13 @@ enum Command {
 fn load_image_raw(
     path: &PathBuf,
     force_alpha: bool,
-) -> Result<(Vec<u8>, u32, u32, Channels), BoxErr> {
+) -> Result<(Vec<u8>, u32, u32, Channels), anyhow::Error> {
     let in_mmap = unsafe { Mmap::map(&File::open(path)?)? };
     let img = image::ImageReader::new(Cursor::new(in_mmap))
         .with_guessed_format()
         .map_err(image::ImageError::from)
-        .and_then(|i| i.decode())?;
+        .and_then(|i| i.decode())
+        .context("failed to decode image-rs image.")?;
 
     let (w, h) = image::GenericImageView::dimensions(&img);
     let has_color = img.color().has_color();
@@ -89,14 +88,14 @@ fn save_pixels(
     h: u32,
     channels: Channels,
     pixels: &[u8],
-) -> Result<(), BoxErr> {
+) -> Result<(), anyhow::Error> {
     let channels = match channels {
         Channels::Gray => ExtendedColorType::L8,
         Channels::GrayA => ExtendedColorType::La8,
         Channels::Rgb => ExtendedColorType::Rgb8,
         Channels::Rgba => ExtendedColorType::Rgba8,
     };
-    image::save_buffer(path, pixels, w, h, channels)?;
+    image::save_buffer(path, pixels, w, h, channels).context("Failed to save image to disk.")?;
     Ok(())
 }
 
@@ -106,8 +105,9 @@ fn cmd_encode(
     level: i32,
     tile_rows: u32,
     force_alpha: bool,
-) -> Result<(), BoxErr> {
-    let (pixels, w, h, channels) = load_image_raw(&input, force_alpha)?;
+) -> Result<(), anyhow::Error> {
+    let (pixels, w, h, channels) =
+        load_image_raw(&input, force_alpha).context("Failed to load raw image.")?;
 
     let opts = EncodeOptions {
         channels,
@@ -129,14 +129,15 @@ fn cmd_encode(
         .open(&output)?;
     file.set_len(max_len as u64)?;
 
-    let mut out_mmap = unsafe { MmapMut::map_mut(&file)? };
+    let mut out_mmap = unsafe { MmapMut::map_mut(&file).context("Failed to mmap input file.")? };
 
     // out_mmap must be dropped before truncating file len, so it is scoped here.
     let (bytes_written, dt) = {
         let t0 = Instant::now();
-        let written = qoz::encode_into_buf(&pixels, w, h, &opts, &mut out_mmap)? as u64;
+        let written = qoz::encode_into_buf(&pixels, w, h, &opts, &mut out_mmap)
+            .context("failed to encode image.")? as u64;
         let dt = t0.elapsed();
-        out_mmap.flush()?;
+        out_mmap.flush().context("Failed to flush mmap to disk.")?;
         (written, dt)
     };
     file.set_len(bytes_written)?;
@@ -151,11 +152,11 @@ fn cmd_encode(
     Ok(())
 }
 
-fn cmd_decode(input: PathBuf, output: PathBuf) -> Result<(), BoxErr> {
+fn cmd_decode(input: PathBuf, output: PathBuf) -> Result<(), anyhow::Error> {
     let in_mmap = unsafe { Mmap::map(&File::open(input)?)? };
 
     let t0 = Instant::now();
-    let (header, pixels) = qoz::decode(&in_mmap)?;
+    let (header, pixels) = qoz::decode(&in_mmap).context("failed to decode image.")?;
     let dt = t0.elapsed();
 
     let mb_s = (pixels.len() as f64 / 1e6) / dt.as_secs_f64();
@@ -176,9 +177,9 @@ fn cmd_decode(input: PathBuf, output: PathBuf) -> Result<(), BoxErr> {
     Ok(())
 }
 
-fn cmd_info(input: PathBuf) -> Result<(), BoxErr> {
+fn cmd_info(input: PathBuf) -> Result<(), anyhow::Error> {
     let data = unsafe { Mmap::map(&File::open(&input)?)? };
-    let header = qoz::read_header(&data)?;
+    let header = qoz::read_header(&data).context("Failed to decode qoz header.")?;
     println!("file:       {}", input.display());
     println!("dimensions: {}x{}", header.width, header.height);
     println!("channels:   {}", header.channels);
@@ -194,12 +195,15 @@ fn cmd_info(input: PathBuf) -> Result<(), BoxErr> {
     Ok(())
 }
 
-fn cmd_bench(input: PathBuf, iterations: u32, level: i32, tile_rows: u32) -> Result<(), BoxErr> {
+fn cmd_bench(
+    input: PathBuf,
+    iterations: u32,
+    level: i32,
+    tile_rows: u32,
+) -> Result<(), anyhow::Error> {
     let (pixels, w, h, channels) = load_image_raw(&input, false)?;
     if channels != Channels::Rgb && channels != Channels::Rgba {
-        return Err(
-            "bench only supports 3 or 4 channel source images (qoi requires 3 or 4)".into(),
-        );
+        bail!("bench only supports 3 or 4 channel source images (qoi requires 3 or 4)");
     }
 
     let opts = EncodeOptions {
@@ -284,7 +288,7 @@ fn cmd_bench(input: PathBuf, iterations: u32, level: i32, tile_rows: u32) -> Res
     Ok(())
 }
 
-fn main() -> Result<(), BoxErr> {
+fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Encode {
