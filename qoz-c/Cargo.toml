@@ -1,0 +1,13 @@
+[package]
+name = "qoz-c"
+version = "0.1.0"
+edition = "2024"
+description = "C bindings for qoz (libqoz)"
+license = "MIT"
+
+[lib]
+name = "qoz"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+qoz = { path = "../qoz" }
