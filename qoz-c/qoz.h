@@ -24,7 +24,7 @@ typedef struct QozDesc {
      */
     uint8_t channels;
     /**
-     * 0 = srgb, 1 = linear (purely informative, like QOI's colorspace byte)
+     * 0 = srgb, 1 = linear (purely informative)
      */
     uint8_t colorspace;
 } QozDesc;
@@ -99,6 +99,10 @@ uint8_t *qoz_encode(const uint8_t *pixels,
  * Upper bound on the encoded size for the given dimensions - useful for
  * pre-allocating a buffer on the caller's side, if desired. `channels`
  * must be 1-4; returns 0 for an invalid channel count.
+ */
+ size_t qoz_max_encoded_len(uint32_t width, uint32_t height, uint8_t channels, uint32_t tile_rows);
+
+/**
  * Free a buffer returned by [`qoz_decode`] or [`qoz_encode`]. `len` must
  * be exactly the byte length documented for that call. Safe to call with
  * `ptr == NULL` (no-op).

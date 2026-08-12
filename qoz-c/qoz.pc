@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: qoz
+Description: QOZ image format C bindings (libqoz) - zstd-compressed raw pixel tiles, tuned for fast decoding
+Version: 0.1.0
+Libs: -L${libdir} -lqoz
+Cflags: -I${includedir}
