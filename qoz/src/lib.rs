@@ -468,6 +468,8 @@ pub fn encode_into_buf(
       || zstd::bulk::Compressor::new(opts.level),
       |compressor_res, (tile, out_slice)| match compressor_res {
         Ok(compressor) => {
+          // windowLog must be in [ZSTD_WINDOWLOG_MIN, ZSTD_WINDOWLOG_MAX] = [10, 31]. small tiles
+          // would otherwise produce an out-of-range value zstd rejects.
           let window_size = tile.len().max(1).ilog2().clamp(10, 31);
           compressor.set_parameter(WindowLog(window_size))?;
           let n = compressor
@@ -601,6 +603,8 @@ pub fn decode_into_buf(data: &[u8], out: &mut [u8]) -> Result<Header, QozError> 
       || zstd::bulk::Decompressor::new(),
       |decompressor_res, (out_slice, blob)| match decompressor_res {
         Ok(decompressor) => {
+          // must match the windowLog the encoder used for this tile, which was derived from the
+          // tile's uncompressed size, which is out_slice.len() here.
           let window_size = out_slice.len().max(1).ilog2().clamp(10, 31);
           decompressor.set_parameter(DParameter::WindowLogMax(window_size))?;
           let n = decompressor
