@@ -1,0 +1,64 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare-release:
+    name: Build, Package, and Draft Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdav1d-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run workspace tests
+        run: cargo test --frozen --release --features qoz-cli/avif
+
+      - name: Build workspace binaries
+        run: cargo build --frozen --release --features qoz-cli/avif
+
+      - name: Create release archive and checksum
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          ARCHIVE_NAME="qoz-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+
+          mkdir -p dist/bin dist/lib
+
+          cp target/release/qoz dist/bin/
+          cp target/release/libqoz.so dist/lib/
+          cp target/release/libqoz.a dist/lib/
+          cp -r qoz-c/include dist/
+
+          tar -czvf "$ARCHIVE_NAME" -C dist .
+
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+      - name: Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: v${{ github.event.inputs.version }}
+          name: v${{ github.event.inputs.version }}
+          generate_release_notes: true
+          files: |
+            qoz-v${{ github.event.inputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            qoz-v${{ github.event.inputs.version }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+          fail_on_unmatched_files: true
