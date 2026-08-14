@@ -2,8 +2,14 @@
 members = ["qoz", "qoz-cli", "qoz-c"]
 resolver = "2"
 
+[workspace.package]
+description = "QOZ: a minimal image format storing zstd-compressed raw pixel tiles, optimized for decode speed"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-# panic = "abort"
+strip = true

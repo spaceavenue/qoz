@@ -1,7 +1,8 @@
 [package]
 name = "qoz-cli"
-version = "0.2.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "qoz"
@@ -17,4 +18,8 @@ anyhow = "1.0.104"
 [dependencies.image]
 version = "0.25.10"
 default-features = false
-features = ["avif-native", "png", "jpeg", "webp", "gif", "bmp", "tiff", "tga", "dds", "exr", "hdr", "ico", "pnm", "qoi", "rayon"]
+features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "tga", "dds", "exr", "hdr", "ico", "pnm", "qoi", "rayon"]
+
+[features]
+default = []
+avif = ["image/avif-native"]

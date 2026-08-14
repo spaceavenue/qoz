@@ -1,9 +1,9 @@
 [package]
 name = "qoz"
-version = "0.2.0"
-edition = "2024"
-description = "QOZ: a minimal image format storing zstd-compressed raw pixel tiles, optimized for decode speed"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
 
 [dependencies]
 zstd = { version = "0.13", default-features = false }
