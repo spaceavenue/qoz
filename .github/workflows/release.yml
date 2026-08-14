@@ -31,10 +31,10 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Run workspace tests
-        run: cargo test --frozen --release --features qoz-cli/avif
+        run: cargo test --release --features qoz-cli/avif
 
       - name: Build workspace binaries
-        run: cargo build --frozen --release --features qoz-cli/avif
+        run: cargo build --release --features qoz-cli/avif
 
       - name: Create release archive and checksum
         run: |
