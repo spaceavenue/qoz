@@ -4,7 +4,7 @@ libdir=${exec_prefix}/lib
 includedir=${prefix}/include
 
 Name: qoz
-Description: QOZ image format C bindings (libqoz) - zstd-compressed raw pixel tiles, tuned for fast decoding
+Description: QOZ C bindings (libqoz) - zstd-compressed raw pixel tiles, optimized for decode speed
 Version: 0.1.0
 Libs: -L${libdir} -lqoz
 Cflags: -I${includedir}

@@ -41,12 +41,13 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
           ARCHIVE_NAME="qoz-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
-          mkdir -p dist/bin dist/lib
+          mkdir -p dist/bin dist/lib dist/lib/pkgconfig dist/include 
 
           cp target/release/qoz dist/bin/
           cp target/release/libqoz.so dist/lib/
           cp target/release/libqoz.a dist/lib/
-          cp -r qoz-c/include dist/
+          cp qoz-c/qoz.h dist/include/
+          cp qoz-c/qoz.pc dist/lib/pkgconfig/
 
           tar -czvf "$ARCHIVE_NAME" -C dist .
 
